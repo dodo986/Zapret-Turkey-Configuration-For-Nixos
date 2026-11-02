@@ -18,15 +18,16 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 SHARE_DIR = Path(__file__).resolve().parent
 MODULE_SOURCE = SHARE_DIR / "module.nix"
 PRESETS_SOURCE = SHARE_DIR / "presets.json"
 
-DEFAULT_CONFIG = Path("/etc/nixos/configuration.nix")
-DEFAULT_SETTINGS = Path("/etc/nixos/zapret-turkey.nix")
-DEFAULT_MODULE = Path("/etc/nixos/zapret-turkey-module.nix")
+NIXOS_DIR = Path("/etc/nixos")
+DEFAULT_CONFIG = NIXOS_DIR / "configuration.nix"
+DEFAULT_SETTINGS = NIXOS_DIR / "zapret-turkey.nix"
+DEFAULT_MODULE = NIXOS_DIR / "zapret-turkey-module.nix"
 
 IMPORT_LINE = "./zapret-turkey.nix"
 DEFAULT_PRESETS = ["discord", "roblox"]
@@ -172,21 +173,52 @@ def backup_path(path: Path) -> Path:
     return candidate
 
 
+def target_owner(path: Path) -> tuple[int, int] | None:
+    """Keep user-owned files editable when the installer runs through sudo."""
+    sudo_owner = None
+    if os.geteuid() == 0 and os.environ.get("SUDO_UID") and os.environ.get("SUDO_GID"):
+        sudo_owner = (int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+
+    if path.exists():
+        result = path.stat()
+        owner = (result.st_uid, result.st_gid)
+        # Repair root-owned files created by older installer runs.
+        if owner[0] == 0 and sudo_owner is not None and sudo_owner[0] != 0:
+            return sudo_owner
+        return owner
+    return sudo_owner
+
+
+def apply_owner(path: Path, owner: tuple[int, int] | None) -> None:
+    if owner is None:
+        return
+    try:
+        os.chown(path, *owner)
+    except OSError:
+        pass
+
+
 def backup_file(path: Path) -> Path | None:
     if not path.exists():
         return None
+    owner = target_owner(path)
     backup = backup_path(path)
     shutil.copy2(path, backup)
+    apply_owner(backup, owner)
     return backup
 
 
 def write_text(path: Path, text: str) -> Path | None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    owner = target_owner(path)
+    mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
     backup = backup_file(path)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(text, encoding="utf-8")
-    os.chmod(temporary, 0o644)
+    os.chmod(temporary, mode)
+    apply_owner(temporary, owner)
     os.replace(temporary, path)
+    apply_owner(path, owner)
     return backup
 
 
@@ -233,13 +265,83 @@ def find_nixos_rebuild() -> str:
 
 def rebuild(flake_attr: str | None, dry_run: bool) -> None:
     command = [find_nixos_rebuild(), "switch"]
-    flake = Path("/etc/nixos/flake.nix")
+    flake = NIXOS_DIR / "flake.nix"
     if flake.exists():
-        reference = "/etc/nixos"
+        reference = str(NIXOS_DIR)
         if flake_attr:
             reference += "#" + flake_attr
         command.extend(["--flake", reference])
-        info("Detected /etc/nixos/flake.nix; using flake rebuild.")
+        info(f"Detected {flake}; using flake rebuild.")
+    run_command(command, dry_run=dry_run)
+
+
+def find_git_root(directory: Path) -> Path | None:
+    if not (directory / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return Path(root) if root else None
+
+
+def is_tracked_by_git(root: Path, path: Path) -> bool:
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "-C",
+            str(root),
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def stage_for_flake(paths: list[Path], dry_run: bool = False) -> None:
+    """Stage generated files so a Git-backed /etc/nixos flake can see them."""
+    if dry_run or not (NIXOS_DIR / "flake.nix").exists():
+        return
+    root = find_git_root(NIXOS_DIR)
+    if root is None:
+        return
+
+    root = root.resolve()
+    candidates: list[str] = []
+    for path in paths:
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved.exists() or is_tracked_by_git(root, resolved):
+            candidates.append(str(resolved))
+
+    if not candidates:
+        return
+
+    command = ["git", "-c", "safe.directory=*", "-C", str(root), "add", "--", *candidates]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        # Keep .git/index owned by the user who invoked sudo.
+        command = [shutil.which("sudo") or "sudo", "-u", sudo_user, "-H", *command]
+
+    info("Staging generated files so the flake can see them...")
     run_command(command, dry_run=dry_run)
 
 
@@ -640,6 +742,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     info()
     info(f"Wrote {args.settings_file}")
     info(f"Wrote {args.module_file}")
+    stage_for_flake([args.settings_file, args.module_file])
 
     if args.no_rebuild:
         info("Skipping rebuild. Apply with: sudo nixos-rebuild switch")
@@ -671,6 +774,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             backup = backup_path(path)
             path.replace(backup)
             info(f"Moved {path} to {backup}")
+
+    stage_for_flake([args.settings_file, args.module_file])
 
     if args.no_rebuild:
         info("Skipping rebuild. Apply with: sudo nixos-rebuild switch")

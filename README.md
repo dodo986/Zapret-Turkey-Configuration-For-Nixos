@@ -45,7 +45,8 @@ The installer will:
 4. Add `./zapret-turkey.nix` to the `imports` list in
    `/etc/nixos/configuration.nix`.
 5. Run `nixos-rebuild switch` (or a flake rebuild if `/etc/nixos/flake.nix`
-   exists).
+   exists). For a Git-backed `/etc/nixos` flake, it stages the generated files
+   so Nix can see them; you can commit them afterwards.
 
 The default preset set is `discord` + `roblox`. Add more in one command:
 
