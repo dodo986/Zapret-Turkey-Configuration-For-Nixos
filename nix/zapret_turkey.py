@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 SHARE_DIR = Path(__file__).resolve().parent
 MODULE_SOURCE = SHARE_DIR / "module.nix"
@@ -31,6 +31,13 @@ DEFAULT_MODULE = Path("/etc/nixos/zapret-turkey-module.nix")
 IMPORT_LINE = "./zapret-turkey.nix"
 DEFAULT_PRESETS = ["discord", "roblox"]
 DEFAULT_DNS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"]
+
+IMPORTS_DEF_RE = re.compile(r"(?m)^([ \t]*)imports[ \t]*=")
+GENERATED_IMPORT_BLOCK_RE = re.compile(
+    r"(?m)^[ \t]*imports[ \t]*=[ \t]*\[[ \t]*"
+    + re.escape(IMPORT_LINE)
+    + r"[ \t]*\][ \t]*;[ \t]*\n?"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -358,55 +365,134 @@ def render_settings(
 # ---------------------------------------------------------------------------
 
 
+def skip_whitespace_and_comments(text: str, index: int) -> int:
+    while index < len(text):
+        char = text[index]
+        if char in " \t\r\n":
+            index += 1
+        elif char == "#":
+            newline = text.find("\n", index)
+            index = len(text) if newline == -1 else newline + 1
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = len(text) if end == -1 else end + 2
+        else:
+            break
+    return index
+
+
+def find_matching_bracket(text: str, start: int) -> int:
+    depth = 1
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == "#":
+            newline = text.find("\n", index)
+            index = len(text) if newline == -1 else newline + 1
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = len(text) if end == -1 else end + 2
+        elif char == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                elif text[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+        elif text.startswith("''", index):
+            index += 2
+            while index < len(text):
+                if text.startswith("'''", index):
+                    index += 3
+                elif text.startswith("''", index):
+                    index += 2
+                    break
+                else:
+                    index += 1
+        elif char == "[":
+            depth += 1
+            index += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+            index += 1
+        else:
+            index += 1
+    return -1
+
+
+def find_imports(text: str) -> list[tuple[str, int, int]]:
+    """Find imports lists, including `imports =` followed by a newline."""
+    imports: list[tuple[str, int, int]] = []
+    for match in IMPORTS_DEF_RE.finditer(text):
+        start = skip_whitespace_and_comments(text, match.end())
+        if start >= len(text) or text[start] != "[":
+            continue
+        end = find_matching_bracket(text, start)
+        if end != -1:
+            imports.append((match.group(1), start, end))
+    return imports
+
+
+def insert_import(text: str, indent: str, start: int, end: int) -> str:
+    body = text[start + 1 : end]
+    entry_indent = indent + "  "
+    for line in body.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("]"):
+            continue
+        leading = line[: len(line) - len(line.lstrip(" \t"))]
+        if len(leading) >= len(indent):
+            entry_indent = leading
+            break
+
+    if "\n" in body:
+        newline = body.index("\n")
+        insert_at = start + 1 + newline + 1
+        return text[:insert_at] + entry_indent + IMPORT_LINE + "\n" + text[insert_at:]
+
+    # Inline list: re-render it one item per line.
+    items = [item for item in body.split() if item]
+    items.insert(0, IMPORT_LINE)
+    new_body = "\n" + "\n".join(entry_indent + item for item in items) + "\n" + indent
+    return text[: start + 1] + new_body + text[end:]
+
+
 def add_import(config_path: Path) -> Path | None:
     try:
         text = config_path.read_text(encoding="utf-8")
     except OSError as exc:
         die(f"cannot read {config_path}: {exc}")
 
+    imports = find_imports(text)
+    repaired = False
+    if len(imports) > 1:
+        without_generated = GENERATED_IMPORT_BLOCK_RE.sub("", text)
+        if without_generated != text:
+            text = without_generated
+            imports = find_imports(text)
+            repaired = True
+
     if IMPORT_LINE in text:
+        if repaired:
+            backup = write_text(config_path, text)
+            info(f"Removed the duplicate generated imports list from {config_path}.")
+            return backup
         info(f"{config_path} already imports {IMPORT_LINE}; leaving it alone.")
         return None
 
-    match = re.search(r"(?m)^([ \t]*)imports[ \t]*=[ \t]*\[", text)
-    if match:
-        indent = match.group(1)
-        start = match.end()
-        depth = 1
-        index = start
-        while index < len(text):
-            if text[index] == "[":
-                depth += 1
-            elif text[index] == "]":
-                depth -= 1
-                if depth == 0:
-                    break
-            index += 1
-        if index >= len(text):
-            die(f"cannot find the end of the imports list in {config_path}")
-
-        body = text[start:index]
-        if "\n" in body:
-            # Multiline list: add one entry at the top and keep comments intact.
-            insertion = "\n" + indent + "  " + IMPORT_LINE
-            text = text[:start] + insertion + text[start:]
-        else:
-            # Inline list: re-render it one item per line.
-            items = [item for item in body.split() if item]
-            items.insert(0, IMPORT_LINE)
-            new_body = (
-                "\n"
-                + "\n".join(indent + "  " + item for item in items)
-                + "\n"
-                + indent
-            )
-            text = text[:start] + new_body + text[index:]
+    if imports:
+        indent, start, end = imports[0]
+        text = insert_import(text, indent, start, end)
     else:
         index = text.rfind("}")
         if index == -1:
             die(f"cannot find the top-level attrset in {config_path}")
-        insertion = f"\n  imports = [ {IMPORT_LINE} ];\n"
-        text = text[:index] + insertion + text[index:]
+        text = text[:index] + f"\n  imports = [ {IMPORT_LINE} ];\n" + text[index:]
 
     backup = write_text(config_path, text)
     info(f"Added {IMPORT_LINE} to {config_path}.")
@@ -419,10 +505,11 @@ def remove_import(config_path: Path) -> Path | None:
     except OSError as exc:
         die(f"cannot read {config_path}: {exc}")
 
-    if IMPORT_LINE not in text:
+    if IMPORT_LINE not in text and not GENERATED_IMPORT_BLOCK_RE.search(text):
         info(f"{config_path} does not import {IMPORT_LINE}; nothing to remove.")
         return None
 
+    text = GENERATED_IMPORT_BLOCK_RE.sub("", text)
     text = re.sub(r"(?m)^[ \t]*" + re.escape(IMPORT_LINE) + r"[ \t]*\n", "", text)
     text = text.replace(IMPORT_LINE, "")
     backup = write_text(config_path, text)
